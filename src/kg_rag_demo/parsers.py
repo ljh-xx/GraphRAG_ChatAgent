@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - optional dependency runtime guard
     RapidOCR = None
 
 
-SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".pptx", ".png", ".jpg", ".jpeg", ".webp"}
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".md", ".txt", ".xlsx", ".xls"}
 
 
 class DocumentParser:
@@ -41,6 +41,12 @@ class DocumentParser:
             return self._parse_pptx(file_path)
         if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
             return self._parse_image(file_path)
+        if suffix == ".md":
+            return self._parse_text(file_path, "markdown")
+        if suffix == ".txt":
+            return self._parse_text(file_path, "text")
+        if suffix in {".xlsx", ".xls"}:
+            return self._parse_excel(file_path)
         raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
     def parse_directory(self, directory: str | Path) -> list[ParsedDocument]:
@@ -79,7 +85,7 @@ class DocumentParser:
                     doc_id=doc_id,
                     title=path.stem,
                     text=text.strip(),
-                    modality="pdf_page",
+                    modality="pdf",
                     page_number=page_index,
                 )
             )
@@ -141,6 +147,61 @@ class DocumentParser:
         text = self._ocr_image_bytes(image_bytes)
         self._log(f"[parse][image] {path.name} OCR 提取到 {len(text)} 个字符")
         return self._single_record(path, text, "image")
+
+    def _parse_text(self, path: Path, modality: str = "text") -> list[ParsedDocument]:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            # 如果 utf-8 失败，尝试 gbk (针对某些 Windows 环境下的文本文件)
+            with path.open("r", encoding="gbk") as f:
+                text = f.read()
+        
+        self._log(f"[parse][{modality}] {path.name} 提取到 {len(text)} 个字符")
+        return self._single_record(path, text, modality)
+
+    def _parse_excel(self, path: Path) -> list[ParsedDocument]:
+        import pandas as pd
+        df = pd.read_excel(path)
+        records: list[ParsedDocument] = []
+        doc_id = self._file_id(path)
+        
+        # 尝试匹配可能的列名（不区分大小写）
+        q_col = next((c for c in df.columns if str(c).lower() in ["question", "问题", "q"]), None)
+        a_col = next((c for c in df.columns if str(c).lower() in ["answer", "答案", "a"]), None)
+
+        if q_col is None or a_col is None:
+            self._log(f"[parse][excel] 警告：{path.name} 未能找到明确的 question/answer 列，将合并所有列内容")
+            for idx, row in df.iterrows():
+                text = " ".join([str(v) for v in row.values if pd.notna(v)])
+                if text.strip():
+                    records.append(ParsedDocument(
+                        source_path=str(path),
+                        doc_id=doc_id,
+                        title=f"{path.stem}_row_{idx+1}",
+                        text=text,
+                        modality="excel_row",
+                        page_number=idx + 1
+                    ))
+        else:
+            self._log(f"[parse][excel] {path.name} 识别到问答列: {q_col}, {a_col}")
+            for idx, row in df.iterrows():
+                q = str(row[q_col]).strip() if pd.notna(row[q_col]) else ""
+                a = str(row[a_col]).strip() if pd.notna(row[a_col]) else ""
+                if q or a:
+                    combined_text = f"问题: {q}\n答案: {a}"
+                    records.append(ParsedDocument(
+                        source_path=str(path),
+                        doc_id=doc_id,
+                        title=path.stem,
+                        text=combined_text,
+                        modality="excel_qa",
+                        page_number=idx + 1,
+                        extra_meta={"question": q, "answer": a}
+                    ))
+        
+        self._log(f"[parse][excel] {path.name} 解析完成，共提取 {len(records)} 条记录")
+        return records
 
     def _single_record(self, path: Path, text: str, modality: str) -> list[ParsedDocument]:
         cleaned = text.strip()

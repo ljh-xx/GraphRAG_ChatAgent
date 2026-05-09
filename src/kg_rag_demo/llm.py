@@ -17,17 +17,20 @@ from .models import EntityNode, RelationEdge
 GRAPH_SCHEMA_PROMPT = """你是一个知识图谱抽取助手。
 请从给定文本中抽取实体和关系，并严格输出 JSON。
 
-输出格式:
+输出格式 (严格 JSON):
 {
-  "entities": [{"name": "实体名", "label": "实体类型"}],
-  "relations": [{"source": "实体A", "target": "实体B", "relation": "关系", "evidence": "证据短语"}]
+  "entities": [{"name": "实体名", "label": "类型"}],
+  "relations": [{"source": "源实体", "target": "目标实体", "relation": "关系描述", "evidence": "原文证据"}]
 }
 
 要求:
 1. 最多抽取 8 个实体和 12 条关系。
 2. 实体名必须来自原文，不要凭空编造。
 3. 如果内容不足，返回空数组。
-4. 只输出 JSON，不要输出解释。
+4. 实体可以是具体事物（如 AI 模型），也可以是抽象概念（如 数字经济、核心生产力、2030目标）。
+5. 关系应体现逻辑连接（如：扮演角色、属于、包含、旨在实现）。
+6. 即使文本简短，也请尽力提取其中蕴含的逻辑结构。
+7. 只输出 JSON，不要输出解释。
 """
 
 
@@ -80,89 +83,6 @@ HYPOTHETICAL_ANSWER_PROMPT = """你是一个检索增强助手。
 3. 不要声明“不确定”，直接给出一个有信息量的假设性答案文本。
 """
 
-GRAPH_ENTITY_SYNONYM_PROMPT = """你是知识图谱查询扩展助手。
-请基于输入的实体列表，为每个实体补充查询友好的同义词/别称（用于并行检索）。
-
-严格输出 JSON，格式：
-{
-  "items": [
-    {"entity": "实体A", "synonyms": ["同义词1", "同义词2"]}
-  ]
-}
-
-要求：
-1. 只输出与实体语义等价或高相关的别称，不要扩展上下位概念。
-2. 每个实体同义词数量不超过指定上限。
-3. 可以包含中英混合术语（如 transaction）。
-4. 若没有可靠同义词，返回空数组。
-5. 只输出 JSON，不要解释。
-"""
-
-INTENT_CLASSIFY_PROMPT = """你是多轮问答中的意图路由助手。你只能返回三类意图：
-- unrelated: 与数据库/课程主题无关，不应调用RAG/KG检索
-- already_retrieved: 与最近已检索的问题高度相关，可复用短期记忆
-- need_retrieve: 需要执行新的RAG/KG检索
-
-严格输出 JSON，格式：
-{
-  "intent": "unrelated|already_retrieved|need_retrieve",
-  "reason": "简短原因"
-}
-
-要求：
-1. 判断时可使用最近对话摘要与主题关键词。
-2. 默认保守：不确定时返回 need_retrieve。
-3. 只输出 JSON，不要解释。
-"""
-
-MEMORY_REUSE_ANSWER_PROMPT = """你是一个多轮问答助手。下面给出历史检索提示词（包含当时证据）和历史回答。
-请优先复用历史证据回答当前问题；若历史证据不足，明确说“资料不足”，不要编造新事实。
-"""
-
-LONG_MEMORY_WRITE_INTENT_PROMPT = """你是长期记忆写入判断器。判断当前用户问题是否包含“应长期保存的用户事实”。
-典型应写入的内容：
-- 用户自我信息（姓名、身份、偏好、限制、长期目标）
-- 用户给助手的长期人设/规则
-- 未来对话需要持续记住的约束
-
-严格输出 JSON：
-{
-  "should_write": true/false,
-  "reason": "简短原因"
-}
-
-要求：
-1. 一般知识问答内容（如课程问题）通常不写入长期记忆。
-2. 不确定时返回 false。
-3. 只输出 JSON。
-"""
-
-LONG_MEMORY_EXTRACT_PROMPT = """你是长期记忆提炼助手。请从本轮对话中提炼1条可长期保存的用户信息。
-严格输出 JSON：
-{
-  "memory": "一句话的长期记忆内容"
-}
-
-要求：
-1. 只保留未来对话稳定有用的信息。
-2. 不要记录一次性的问答细节。
-3. 若没有可提炼内容，返回空字符串。
-4. 只输出 JSON。
-"""
-
-EVIDENCE_SELECTION_PROMPT = """你是证据筛选助手。请从候选检索片段中挑选最能回答问题的片段ID。
-严格输出 JSON：
-{
-  "keep_chunk_ids": ["chunk_id_1", "chunk_id_2"]
-}
-
-要求：
-1. 优先选择信息互补、非重复的证据。
-2. 如果候选中存在冲突，优先保留表述更完整、更贴近问题的片段。
-3. 最多保留指定数量。
-4. 只输出 JSON，不要解释。
-"""
-
 
 class LLMClient:
     def __init__(self, settings: Settings) -> None:
@@ -204,7 +124,7 @@ class LLMClient:
     def reranker(self) -> CrossEncoder:
         model_path = resolve_local_hf_model(self.settings.rerank_model)
         return CrossEncoder(
-            model_name=model_path,
+            model_name_or_path=model_path,
             device=self.settings.rerank_device,
         )
 
@@ -304,87 +224,6 @@ class LLMClient:
         question: str,
         chunk_contexts: list[dict[str, Any]],
         graph_contexts: list[dict[str, Any]],
-        memory_context: str = "",
-    ) -> str:
-        prompt = self.build_answer_prompt(question, chunk_contexts, graph_contexts, memory_context=memory_context)
-        return self.chat(ANSWER_PROMPT, prompt)
-
-    def answer_question_with_prompt(
-        self,
-        question: str,
-        chunk_contexts: list[dict[str, Any]],
-        graph_contexts: list[dict[str, Any]],
-        memory_context: str = "",
-    ) -> tuple[str, str]:
-        prompt = self.build_answer_prompt(question, chunk_contexts, graph_contexts, memory_context=memory_context)
-        answer = self.chat(ANSWER_PROMPT, prompt)
-        return answer, prompt
-
-    def answer_from_memory_prompt(
-        self,
-        question: str,
-        historical_prompt: str,
-        historical_answer: str,
-        memory_context: str = "",
-    ) -> tuple[str, str]:
-        user_prompt = (
-            f"会话记忆:\n{memory_context or '无'}\n\n"
-            f"当前问题:\n{question.strip()}\n\n"
-            f"历史回答:\n{historical_answer.strip()}\n\n"
-            f"历史检索提示词:\n{historical_prompt.strip()}\n"
-        )
-        answer = self.chat(MEMORY_REUSE_ANSWER_PROMPT, user_prompt)
-        return answer, user_prompt
-
-    def classify_intent_with_context(
-        self,
-        question: str,
-        recent_turns: list[dict[str, Any]],
-        domain_keywords: list[str],
-    ) -> dict[str, str]:
-        payload = {
-            "question": question.strip(),
-            "domain_keywords": [item.strip() for item in domain_keywords if item.strip()],
-            "recent_turns": recent_turns,
-        }
-        raw = self.chat(INTENT_CLASSIFY_PROMPT, json.dumps(payload, ensure_ascii=False))
-        data = self._safe_load_json(raw)
-        intent = self._clean_single_line(data.get("intent")).lower()
-        if intent not in {"unrelated", "already_retrieved", "need_retrieve"}:
-            intent = "need_retrieve"
-        reason = self._clean_single_line(data.get("reason")) or "fallback"
-        return {"intent": intent, "reason": reason}
-
-    def classify_long_memory_write_intent(
-        self,
-        question: str,
-        recent_turns: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        payload = {
-            "question": question.strip(),
-            "recent_turns": recent_turns,
-        }
-        raw = self.chat(LONG_MEMORY_WRITE_INTENT_PROMPT, json.dumps(payload, ensure_ascii=False))
-        data = self._safe_load_json(raw)
-        should_write = bool(data.get("should_write", False))
-        reason = self._clean_single_line(data.get("reason")) or "fallback"
-        return {"should_write": should_write, "reason": reason}
-
-    def extract_long_term_memory(self, question: str, answer: str) -> str:
-        payload = {
-            "question": question.strip(),
-            "answer": answer.strip(),
-        }
-        raw = self.chat(LONG_MEMORY_EXTRACT_PROMPT, json.dumps(payload, ensure_ascii=False))
-        data = self._safe_load_json(raw)
-        return self._clean_single_line(data.get("memory"))
-
-    def build_answer_prompt(
-        self,
-        question: str,
-        chunk_contexts: list[dict[str, Any]],
-        graph_contexts: list[dict[str, Any]],
-        memory_context: str = "",
     ) -> str:
         chunk_text = "\n\n".join(
             [
@@ -398,10 +237,7 @@ class LLMClient:
                 for item in graph_contexts
             ]
         )
-        prompt = f"""会话记忆:
-{memory_context or "无"}
-
-问题:
+        prompt = f"""问题:
 {question}
 
 检索片段:
@@ -410,78 +246,7 @@ class LLMClient:
 图谱关系:
 {graph_text or "无"}
 """
-        return prompt
-
-    def select_evidence_chunks(
-        self,
-        question: str,
-        chunk_contexts: list[dict[str, Any]],
-        max_chunks: int,
-    ) -> list[str]:
-        if not chunk_contexts:
-            return []
-        max_chunks = max(1, max_chunks)
-        chunk_lines: list[str] = []
-        for item in chunk_contexts:
-            chunk_id = str(item.get("chunk_id", "")).strip()
-            text = self._clean_single_line(str(item.get("text", "")))[:240]
-            title = self._clean_single_line(str(item.get("title", "")))
-            chunk_lines.append(f"- id={chunk_id} | title={title} | text={text}")
-        prompt = (
-            f"问题:\n{question}\n\n"
-            f"最多保留证据数量: {max_chunks}\n\n"
-            f"候选片段:\n" + "\n".join(chunk_lines)
-        )
-        raw = self.chat(EVIDENCE_SELECTION_PROMPT, prompt)
-        payload = self._safe_load_json(raw)
-        keep_ids: list[str] = []
-        for item in payload.get("keep_chunk_ids", []):
-            if not isinstance(item, str):
-                continue
-            chunk_id = item.strip()
-            if chunk_id and chunk_id not in keep_ids:
-                keep_ids.append(chunk_id)
-            if len(keep_ids) >= max_chunks:
-                break
-        return keep_ids
-
-    def expand_graph_query_entities(
-        self,
-        entities: list[str],
-        max_synonyms_per_entity: int = 2,
-    ) -> dict[str, list[str]]:
-        cleaned_entities = []
-        for item in entities:
-            name = self._clean_single_line(item)
-            if name and name not in cleaned_entities:
-                cleaned_entities.append(name)
-        if not cleaned_entities or max_synonyms_per_entity <= 0:
-            return {name: [] for name in cleaned_entities}
-
-        user_prompt = (
-            f"实体列表: {json.dumps(cleaned_entities, ensure_ascii=False)}\n"
-            f"每个实体最多同义词数: {max_synonyms_per_entity}"
-        )
-        raw = self.chat(GRAPH_ENTITY_SYNONYM_PROMPT, user_prompt)
-        payload = self._safe_load_json(raw)
-        result: dict[str, list[str]] = {name: [] for name in cleaned_entities}
-
-        for item in payload.get("items", []):
-            if not isinstance(item, dict):
-                continue
-            entity = self._clean_single_line(item.get("entity"))
-            if entity not in result:
-                continue
-            synonyms: list[str] = []
-            for syn in item.get("synonyms", []):
-                term = self._clean_single_line(syn)
-                if not term or term == entity or term in synonyms:
-                    continue
-                synonyms.append(term)
-                if len(synonyms) >= max_synonyms_per_entity:
-                    break
-            result[entity] = synonyms
-        return result
+        return self.chat(ANSWER_PROMPT, prompt)
 
     @staticmethod
     def _format_query_for_embedding(text: str) -> str:
