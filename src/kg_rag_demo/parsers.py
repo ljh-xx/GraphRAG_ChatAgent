@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -18,7 +19,7 @@ except Exception:  # pragma: no cover - optional dependency runtime guard
     RapidOCR = None
 
 
-SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".md", ".txt", ".xlsx", ".xls"}
+SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".md", ".markdown", ".txt", ".xlsx", ".xls"}
 
 
 class DocumentParser:
@@ -41,7 +42,7 @@ class DocumentParser:
             return self._parse_pptx(file_path)
         if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
             return self._parse_image(file_path)
-        if suffix == ".md":
+        if suffix in {".md", ".markdown"}:
             return self._parse_text(file_path, "markdown")
         if suffix == ".txt":
             return self._parse_text(file_path, "text")
@@ -63,10 +64,10 @@ class DocumentParser:
 
     def _parse_pdf(self, path: Path) -> list[ParsedDocument]:
         doc = fitz.open(path)
-        records: list[ParsedDocument] = []
         doc_id = self._file_id(path)
         self._log(f"[parse][pdf] {path.name} 共 {len(doc)} 页")
 
+        full_text_with_pages = []
         for page_index, page in enumerate(doc, start=1):
             text = page.get_text("text").strip()
             if len(text) < 40:
@@ -74,22 +75,58 @@ class DocumentParser:
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                 image_bytes = pix.tobytes("png")
                 text = self._ocr_image_bytes(image_bytes)
+            
+            if text.strip():
+                full_text_with_pages.append((page_index, text))
 
-            if not text.strip():
-                self._log(f"[parse][pdf] 第 {page_index} 页无有效文本，跳过")
-                continue
+        if not full_text_with_pages:
+            self._log(f"[parse][pdf] {path.name} 无有效文本")
+            return []
 
-            records.append(
-                ParsedDocument(
-                    source_path=str(path),
-                    doc_id=doc_id,
-                    title=path.stem,
-                    text=text.strip(),
-                    modality="pdf",
-                    page_number=page_index,
-                )
-            )
-        self._log(f"[parse][pdf] {path.name} 解析完成，保留 {len(records)} 页")
+        # 尝试通过正则表达式识别章节
+        # 常见论文标题模式: 1. Introduction, II. METHODS, Abstract, References
+        section_pattern = re.compile(r"^(\d+\.[\s\t]+|[I|V|X]+\.[\s\t]+|Abstract|References|Conclusion|Introduction|Methodology|Related Work)", re.IGNORECASE | re.MULTILINE)
+        
+        combined_text = "\n".join([t for _, t in full_text_with_pages])
+        
+        # 简单的章节识别：如果匹配到上述模式，且该行字符数不多，认为是标题
+        records: list[ParsedDocument] = []
+        lines = combined_text.splitlines()
+        current_section_text = []
+        current_section_title = "Abstract/Intro"
+        current_page = full_text_with_pages[0][0]
+
+        for line in lines:
+            stripped = line.strip()
+            if section_pattern.match(stripped) and len(stripped) < 100:
+                if current_section_text:
+                    records.append(ParsedDocument(
+                        source_path=str(path),
+                        doc_id=doc_id,
+                        title=f"{path.stem} - {current_section_title}",
+                        text="\n".join(current_section_text).strip(),
+                        modality="pdf",
+                        page_number=current_page,
+                        extra_meta={"section": current_section_title}
+                    ))
+                current_section_title = stripped
+                current_section_text = [line]
+            else:
+                current_section_text.append(line)
+
+        # 最后一节
+        if current_section_text:
+            records.append(ParsedDocument(
+                source_path=str(path),
+                doc_id=doc_id,
+                title=f"{path.stem} - {current_section_title}",
+                text="\n".join(current_section_text).strip(),
+                modality="pdf",
+                page_number=current_page,
+                extra_meta={"section": current_section_title}
+            ))
+
+        self._log(f"[parse][pdf] {path.name} 解析完成，识别到 {len(records)} 个章节")
         return records
 
     def _parse_docx(self, path: Path) -> list[ParsedDocument]:
@@ -162,43 +199,96 @@ class DocumentParser:
 
     def _parse_excel(self, path: Path) -> list[ParsedDocument]:
         import pandas as pd
-        df = pd.read_excel(path)
+        # 读取所有工作表
+        all_sheets = pd.read_excel(path, sheet_name=None)
         records: list[ParsedDocument] = []
         doc_id = self._file_id(path)
         
-        # 尝试匹配可能的列名（不区分大小写）
-        q_col = next((c for c in df.columns if str(c).lower() in ["question", "问题", "q"]), None)
-        a_col = next((c for c in df.columns if str(c).lower() in ["answer", "答案", "a"]), None)
+        for sheet_name, df in all_sheets.items():
+            self._log(f"[parse][excel] 正在处理工作表: {sheet_name}")
+            
+            # 尝试匹配可能的列名（不区分大小写）
+            q_col = next((c for c in df.columns if str(c).lower() in ["question", "问题", "q"]), None)
+            a_col = next((c for c in df.columns if str(c).lower() in ["answer", "答案", "a"]), None)
+            category_col = next((c for c in df.columns if str(c).lower() in ["category", "分类", "类型", "主题", "topic"]), None)
 
-        if q_col is None or a_col is None:
-            self._log(f"[parse][excel] 警告：{path.name} 未能找到明确的 question/answer 列，将合并所有列内容")
-            for idx, row in df.iterrows():
-                text = " ".join([str(v) for v in row.values if pd.notna(v)])
-                if text.strip():
+            if q_col is not None and a_col is not None:
+                self._log(f"[parse][excel] {path.name}[{sheet_name}] 识别到问答列: {q_col}, {a_col}")
+                
+                qa_buffer = []
+                current_buffer_len = 0
+                max_buffer_len = 1000 # 针对短 Q&A 进行聚合，减少后续 LLM 抽取压力
+                
+                for idx, row in df.iterrows():
+                    q = str(row[q_col]).strip() if pd.notna(row[q_col]) else ""
+                    a = str(row[a_col]).strip() if pd.notna(row[a_col]) else ""
+                    cat = str(row[category_col]).strip() if category_col and pd.notna(row[category_col]) else sheet_name
+                    
+                    if q or a:
+                        qa_text = f"问题: {q}\n答案: {a}"
+                        qa_buffer.append(qa_text)
+                        current_buffer_len += len(qa_text)
+                        
+                        if current_buffer_len >= max_buffer_len:
+                            combined_text = "\n---\n".join(qa_buffer)
+                            records.append(ParsedDocument(
+                                source_path=str(path),
+                                doc_id=doc_id,
+                                title=f"{path.stem} - {sheet_name}",
+                                text=combined_text,
+                                modality="excel_qa",
+                                page_number=idx + 1,
+                                extra_meta={"sheet": sheet_name, "category": cat, "is_grouped": True}
+                            ))
+                            qa_buffer = []
+                            current_buffer_len = 0
+                
+                # 处理剩余 buffer
+                if qa_buffer:
+                    combined_text = "\n---\n".join(qa_buffer)
                     records.append(ParsedDocument(
                         source_path=str(path),
                         doc_id=doc_id,
-                        title=f"{path.stem}_row_{idx+1}",
-                        text=text,
-                        modality="excel_row",
-                        page_number=idx + 1
-                    ))
-        else:
-            self._log(f"[parse][excel] {path.name} 识别到问答列: {q_col}, {a_col}")
-            for idx, row in df.iterrows():
-                q = str(row[q_col]).strip() if pd.notna(row[q_col]) else ""
-                a = str(row[a_col]).strip() if pd.notna(row[a_col]) else ""
-                if q or a:
-                    combined_text = f"问题: {q}\n答案: {a}"
-                    records.append(ParsedDocument(
-                        source_path=str(path),
-                        doc_id=doc_id,
-                        title=path.stem,
+                        title=f"{path.stem} - {sheet_name}",
                         text=combined_text,
                         modality="excel_qa",
-                        page_number=idx + 1,
-                        extra_meta={"question": q, "answer": a}
+                        page_number=len(df),
+                        extra_meta={"sheet": sheet_name, "is_grouped": True}
                     ))
+            else:
+                self._log(f"[parse][excel] {path.name}[{sheet_name}] 未能找到明确的问答列，按行/分类合并")
+                if category_col:
+                    # 如果有分类列，按分类合并
+                    for cat_name, group in df.groupby(category_col):
+                        text_parts = []
+                        for _, row in group.iterrows():
+                            row_text = " | ".join([f"{col}: {val}" for col, val in row.items() if pd.notna(val) and col != category_col])
+                            text_parts.append(row_text)
+                        
+                        combined_text = f"分类: {cat_name}\n" + "\n".join(text_parts)
+                        records.append(ParsedDocument(
+                            source_path=str(path),
+                            doc_id=doc_id,
+                            title=f"{path.stem} - {sheet_name} - {cat_name}",
+                            text=combined_text,
+                            modality="excel_row",
+                            page_number=0, # 分组数据无固定行号
+                            extra_meta={"sheet": sheet_name, "category": cat_name}
+                        ))
+                else:
+                    # 无分类列，按行处理
+                    for idx, row in df.iterrows():
+                        text = " ".join([str(v) for v in row.values if pd.notna(v)])
+                        if text.strip():
+                            records.append(ParsedDocument(
+                                source_path=str(path),
+                                doc_id=doc_id,
+                                title=f"{path.stem} - {sheet_name}",
+                                text=text,
+                                modality="excel_row",
+                                page_number=idx + 1,
+                                extra_meta={"sheet": sheet_name}
+                            ))
         
         self._log(f"[parse][excel] {path.name} 解析完成，共提取 {len(records)} 条记录")
         return records
