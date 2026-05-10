@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -75,11 +75,29 @@ SHORT_MEMORY_PATH = MEMORY_DIR / "short_term_memory.jsonl"
 LONG_MEMORY_PATH = MEMORY_DIR / "long_term_memory.jsonl"
 
 
+def _parse_api_keys() -> list[str]:
+    keys_env = os.getenv("OPENAI_API_KEYS", "")
+    if keys_env:
+        return [k.strip() for k in keys_env.split(",") if k.strip()]
+    single_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if single_key:
+        return [single_key]
+    return []
+
+
+def _parse_chat_models() -> list[str]:
+    models_env = os.getenv("OPENAI_CHAT_MODELS", "")
+    if models_env:
+        return [m.strip() for m in models_env.split(",") if m.strip()]
+    single_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+    return [single_model]
+
+
 @dataclass
 class Settings:
-    openai_api_key: str = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+    openai_api_keys: list[str] = field(default_factory=_parse_api_keys)
     openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    openai_chat_model: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    openai_chat_models: list[str] = field(default_factory=_parse_chat_models)
     openai_timeout_seconds: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "90"))
     openai_max_retries: int = max(0, int(os.getenv("OPENAI_MAX_RETRIES", "2")))
     openai_retry_backoff_seconds: float = float(os.getenv("OPENAI_RETRY_BACKOFF_SECONDS", "2"))
@@ -91,6 +109,7 @@ class Settings:
     neo4j_password: str = os.getenv("NEO4J_PASSWORD", "")
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "1000"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "80"))
+    vector_batch_size: int = max(50, int(os.getenv("VECTOR_BATCH_SIZE", "500")))
     retrieval_k: int = int(os.getenv("RETRIEVAL_K", "5"))
     collection_name: str = os.getenv("CHROMA_COLLECTION", "kg_rag_demo")
     graph_extract_workers: int = max(1, int(os.getenv("GRAPH_EXTRACT_WORKERS", "4")))

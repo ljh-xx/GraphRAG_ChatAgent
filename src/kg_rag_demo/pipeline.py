@@ -123,95 +123,105 @@ class DemoPipeline:
 
     def ingest(self, data_dir: str | None = None) -> dict[str, int]:
         graph_store = self._require_graph_store()
-        docs, chunks, inserted_chunks = self._ingest_vectors(data_dir=data_dir, prefix="ingest")
+        docs, chunks, vector_inserted = self._ingest_vectors(data_dir=data_dir, prefix="ingest")
 
         self._log("[ingest] 初始化 Neo4j 约束")
         graph_store.ensure_constraints()
 
-        relation_count = 0
-        total_chunks = len(chunks)
+        # 断点续传：跳过已处理的 chunk
+        processed_ids = graph_store.get_processed_chunk_ids()
+        remaining = [c for c in chunks if c.chunk_id not in processed_ids]
+        skipped = len(chunks) - len(remaining)
+        if skipped > 0:
+            self._log(f"[ingest] 检测到 {skipped} 个已处理 chunk，自动跳过")
+
+        if not remaining:
+            self._log("[ingest] 没有新的 Chunk 需要处理，图谱构建跳过")
+            return {
+                "documents": len(docs),
+                "vector_chunks": vector_inserted,
+                "graph_chunks": len(chunks),
+                "new_graph_chunks": 0,
+                "relations": 0,
+                "skipped_chunks": skipped,
+            }
+
+        total = len(remaining)
+        original_total = len(chunks)
         graph_extract_workers = max(1, self.settings.graph_extract_workers)
-        if graph_extract_workers == 1:
-            for index, chunk in enumerate(chunks, start=1):
-                self._log(
-                    f"[graph] 处理 chunk {index}/{total_chunks}: "
-                    f"{chunk.title} | 页码 {chunk.page_number if chunk.page_number is not None else '-'} | 长度 {len(chunk.text)}"
+        self._log(f"[graph] 开始处理 {total} 个新 Chunk（跳过 {skipped} 个），并发数: {graph_extract_workers}")
+
+        relation_count = 0
+        future_to_chunk: dict[Future[list[RelationEdge]], tuple[int, ChunkRecord]] = {}
+        completed = 0
+        next_idx = 1
+        heartbeat_seconds = max(1.0, self.settings.graph_progress_heartbeat_seconds)
+        last_heartbeat = time.monotonic()
+
+        def submit(chunk_index: int, chunk_record: ChunkRecord, executor: ThreadPoolExecutor) -> None:
+            nonlocal next_idx
+            self._log(
+                f"[graph] 处理 chunk {chunk_index}/{total} (总进度 {skipped + chunk_index}/{original_total}): "
+                f"{chunk_record.title} | 页码 {chunk_record.page_number if chunk_record.page_number is not None else '-'} | 长度 {len(chunk_record.text)}"
+            )
+            self._log(f"[graph] 提交抽取任务: {chunk_record.chunk_id}")
+            future = executor.submit(self._extract_graph_relations, chunk_record.text)
+            future_to_chunk[future] = (chunk_index, chunk_record)
+            next_idx += 1
+
+        with ThreadPoolExecutor(max_workers=graph_extract_workers, thread_name_prefix="graph-extract") as executor:
+            while next_idx <= total and len(future_to_chunk) < graph_extract_workers:
+                submit(next_idx, remaining[next_idx - 1], executor)
+
+            while future_to_chunk:
+                done, _ = wait(
+                    list(future_to_chunk.keys()),
+                    timeout=heartbeat_seconds,
+                    return_when=FIRST_COMPLETED,
                 )
-                graph_store.upsert_chunk(chunk)
-                self._log(f"[graph] 开始抽取关系: {chunk.chunk_id}")
-                _, relations = self.llm.extract_graph(chunk.text)
-                self._log(f"[graph] 抽取完成，得到 {len(relations)} 条关系")
-                relation_count += graph_store.upsert_relations(chunk, relations)
-                self._log(f"[graph] 已累计写入 {relation_count} 条关系")
-        else:
-            self._log(f"[graph] 启用并发关系抽取，并发数: {graph_extract_workers}")
-            future_to_chunk: dict[Future[list[RelationEdge]], tuple[int, ChunkRecord]] = {}
-            completed_chunks = 0
-            next_chunk_index = 1
-            heartbeat_seconds = max(1.0, self.settings.graph_progress_heartbeat_seconds)
-            last_heartbeat_at = time.monotonic()
-
-            def submit_chunk(chunk_index: int, chunk_record: ChunkRecord, executor: ThreadPoolExecutor) -> None:
-                nonlocal next_chunk_index
-                self._log(
-                    f"[graph] 处理 chunk {chunk_index}/{total_chunks}: "
-                    f"{chunk_record.title} | 页码 {chunk_record.page_number if chunk_record.page_number is not None else '-'} | 长度 {len(chunk_record.text)}"
-                )
-                graph_store.upsert_chunk(chunk_record)
-                self._log(f"[graph] 提交抽取任务: {chunk_record.chunk_id}")
-                future = executor.submit(self._extract_graph_relations, chunk_record.text)
-                future_to_chunk[future] = (chunk_index, chunk_record)
-                next_chunk_index += 1
-
-            with ThreadPoolExecutor(max_workers=graph_extract_workers, thread_name_prefix="graph-extract") as executor:
-                while next_chunk_index <= total_chunks and len(future_to_chunk) < graph_extract_workers:
-                    submit_chunk(next_chunk_index, chunks[next_chunk_index - 1], executor)
-
-                while future_to_chunk:
-                    done, _ = wait(
-                        list(future_to_chunk.keys()),
-                        timeout=heartbeat_seconds,
-                        return_when=FIRST_COMPLETED,
+                if not done:
+                    pending = total - next_idx + 1
+                    self._log(
+                        f"[graph] 抽取进行中，已完成 {completed}/{total} (总进度 {skipped + completed}/{original_total})，"
+                        f"进行中 {len(future_to_chunk)}，待提交 {max(0, pending)}"
                     )
-                    if not done:
-                        pending_submit = total_chunks - next_chunk_index + 1
-                        self._log(
-                            f"[graph] 抽取进行中，已完成 {completed_chunks}/{total_chunks}，"
-                            f"进行中 {len(future_to_chunk)}，待提交 {max(0, pending_submit)}"
-                        )
-                        last_heartbeat_at = time.monotonic()
-                        continue
+                    last_heartbeat = time.monotonic()
+                    continue
 
-                    for future in done:
-                        index, chunk = future_to_chunk.pop(future)
-                        try:
-                            relations = future.result()
-                        except Exception as exc:
-                            completed_chunks += 1
-                            self._log(f"[graph] 抽取失败 {index}/{total_chunks}: {chunk.chunk_id} | {exc}")
-                        else:
-                            completed_chunks += 1
-                            self._log(f"[graph] 抽取完成 {index}/{total_chunks}，得到 {len(relations)} 条关系: {chunk.chunk_id}")
-                            relation_count += graph_store.upsert_relations(chunk, relations)
-                            self._log(f"[graph] 已累计写入 {relation_count} 条关系")
+                for future in done:
+                    index, chunk = future_to_chunk.pop(future)
+                    try:
+                        relations = future.result()
+                    except Exception as exc:
+                        completed += 1
+                        self._log(f"[graph] 抽取失败 {index}/{total}: {chunk.chunk_id} | {exc}")
+                    else:
+                        completed += 1
+                        self._log(f"[graph] 抽取完成 {index}/{total}，得到 {len(relations)} 条关系: {chunk.chunk_id}")
+                        graph_store.upsert_chunk(chunk)
+                        relation_count += graph_store.upsert_relations(chunk, relations)
+                        self._log(f"[graph] 已累计写入 {relation_count} 条关系")
 
-                        while next_chunk_index <= total_chunks and len(future_to_chunk) < graph_extract_workers:
-                            submit_chunk(next_chunk_index, chunks[next_chunk_index - 1], executor)
+                    while next_idx <= total and len(future_to_chunk) < graph_extract_workers:
+                        submit(next_idx, remaining[next_idx - 1], executor)
 
-                    now = time.monotonic()
-                    if now - last_heartbeat_at >= heartbeat_seconds:
-                        pending_submit = total_chunks - next_chunk_index + 1
-                        self._log(
-                            f"[graph] 抽取进行中，已完成 {completed_chunks}/{total_chunks}，"
-                            f"进行中 {len(future_to_chunk)}，待提交 {max(0, pending_submit)}"
-                        )
-                        last_heartbeat_at = now
+                now = time.monotonic()
+                if now - last_heartbeat >= heartbeat_seconds:
+                    pending = total - next_idx + 1
+                    self._log(
+                        f"[graph] 抽取进行中，已完成 {completed}/{total} (总进度 {skipped + completed}/{original_total})，"
+                        f"进行中 {len(future_to_chunk)}，待提交 {max(0, pending)}"
+                    )
+                    last_heartbeat = now
 
         self._log("[ingest] 全部流程完成")
         return {
             "documents": len(docs),
-            "chunks": inserted_chunks,
+            "vector_chunks": vector_inserted,
+            "graph_chunks": original_total,
+            "new_graph_chunks": total,
             "relations": relation_count,
+            "skipped_chunks": skipped,
         }
 
     def ingest_vectors(self, data_dir: str | None = None) -> dict[str, object]:
@@ -276,8 +286,7 @@ class DemoPipeline:
             self.progress_callback(message)
 
     def _extract_graph_relations(self, text: str) -> list[RelationEdge]:
-        worker_llm = LLMClient(self.settings)
-        _, relations = worker_llm.extract_graph(text)
+        _, relations = self.llm.extract_graph(text)
         return relations
 
     def _ingest_vectors(self, data_dir: str | None, prefix: str) -> tuple[list[object], list[ChunkRecord], int]:
@@ -287,10 +296,28 @@ class DemoPipeline:
         self._log(f"[{prefix}] 文档解析完成，共得到 {len(docs)} 条记录，开始切块")
         chunks = chunk_documents(docs, self.settings)
         self._log(f"[{prefix}] 切块完成，共生成 {len(chunks)} 个 chunk")
-        self._log(f"[{prefix}] 开始写入 Chroma 向量库")
-        inserted_chunks = self.vector_store.upsert_chunks(chunks)
-        self._log(f"[{prefix}] 向量写入完成，共写入 {inserted_chunks} 个 chunk")
-        return docs, chunks, inserted_chunks
+
+        # 跳过已入库的 chunk，避免重复 embedding
+        existing_ids = self.vector_store.get_existing_ids()
+        new_chunks = [c for c in chunks if c.chunk_id not in existing_ids]
+        skipped = len(chunks) - len(new_chunks)
+        if skipped > 0:
+            self._log(f"[{prefix}] 检测到 {skipped} 个已入库 chunk，跳过 embedding")
+
+        if new_chunks:
+            batch_size = self.settings.vector_batch_size
+            total = len(new_chunks)
+            inserted = 0
+            for i in range(0, total, batch_size):
+                batch = new_chunks[i : i + batch_size]
+                inserted += self.vector_store.upsert_chunks(batch)
+                self._log(f"[{prefix}] 向量写入进度: {min(i + batch_size, total)}/{total}")
+            self._log(f"[{prefix}] 向量写入完成，本次写入 {inserted} 个（跳过 {skipped} 个）")
+        else:
+            inserted = 0
+            self._log(f"[{prefix}] 所有 chunk 均已入库，无需写入")
+
+        return docs, chunks, inserted
 
     def _self_check_vector_store(self, chunks: list[ChunkRecord]) -> dict[str, str]:
         if not chunks:

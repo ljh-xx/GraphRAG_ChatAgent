@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from collections import Counter
 from typing import Any
@@ -9,6 +10,9 @@ import chromadb
 from .config import CHROMA_DIR, Settings
 from .llm import LLMClient
 from .models import ChunkRecord
+
+# 检测文本中是否包含中文字符
+_HAS_CJK = re.compile(r"[一-鿿㐀-䶿]")
 
 
 class VectorStore:
@@ -20,6 +24,15 @@ class VectorStore:
         self.client: chromadb.ClientAPI | None = None
         self.collection: Any | None = None
         self._open_client()
+
+    def get_existing_ids(self) -> set[str]:
+        """返回 Chroma 中已存在的 chunk_id 集合，用于断点续传."""
+        collection = self._require_collection()
+        count = collection.count()
+        if count == 0:
+            return set()
+        result = collection.get(include=[], limit=count)
+        return set(result.get("ids", []))
 
     def upsert_chunks(self, chunks: list[ChunkRecord]) -> int:
         if not chunks:
@@ -209,9 +222,15 @@ class VectorStore:
         normalized = " ".join(text.lower().split())
         if not normalized:
             return []
-        if " " in normalized:
-            return [token for token in normalized.split(" ") if token]
-        return [ch for ch in normalized if not ch.isspace()]
+        if _HAS_CJK.search(normalized):
+            try:
+                import jieba
+
+                return [t for t in jieba.lcut(normalized) if t.strip()]
+            except ImportError:
+                pass  # jieba 未安装，回退到单字切分
+            return [ch for ch in normalized if not ch.isspace()]
+        return [token for token in normalized.split(" ") if token]
 
     @staticmethod
     def _bm25_idf(doc_count: int, doc_freq: int) -> float:

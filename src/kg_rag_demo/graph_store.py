@@ -24,6 +24,13 @@ class GraphStore:
             for query in queries:
                 session.run(query)
 
+    def get_processed_chunk_ids(self) -> set[str]:
+        """返回 Neo4j 中已存在 Chunk 节点的 chunk_id 集合，用于断点续传."""
+        query = "MATCH (c:Chunk) RETURN c.chunk_id AS chunk_id"
+        with self.driver.session() as session:
+            result = session.run(query)
+            return {record["chunk_id"] for record in result}
+
     def upsert_chunk(self, chunk: ChunkRecord) -> None:
         query = """
         MERGE (d:Document {doc_id: $doc_id})
@@ -53,29 +60,35 @@ class GraphStore:
     def upsert_relations(self, chunk: ChunkRecord, relations: list[RelationEdge]) -> int:
         if not relations:
             return 0
+        batch = [
+            {
+                "source": rel.source,
+                "target": rel.target,
+                "relation": rel.relation,
+                "evidence": rel.evidence,
+            }
+            for rel in relations
+        ]
         query = """
+        UNWIND $batch AS item
         MERGE (c:Chunk {chunk_id: $chunk_id})
-        MERGE (s:Entity {name: $source})
-        MERGE (t:Entity {name: $target})
+        MERGE (s:Entity {name: item.source})
+        MERGE (t:Entity {name: item.target})
         MERGE (c)-[:MENTIONS]->(s)
         MERGE (c)-[:MENTIONS]->(t)
-        MERGE (s)-[r:RELATED_TO {type: $relation, chunk_id: $chunk_id}]->(t)
-        SET r.evidence = $evidence,
+        MERGE (s)-[r:RELATED_TO {type: item.relation, chunk_id: $chunk_id}]->(t)
+        SET r.evidence = item.evidence,
             r.source_path = $source_path,
             r.title = $title
         """
         with self.driver.session() as session:
-            for item in relations:
-                session.run(
-                    query,
-                    chunk_id=chunk.chunk_id,
-                    source=item.source,
-                    target=item.target,
-                    relation=item.relation,
-                    evidence=item.evidence,
-                    source_path=chunk.source_path,
-                    title=chunk.title,
-                )
+            session.run(
+                query,
+                chunk_id=chunk.chunk_id,
+                source_path=chunk.source_path,
+                title=chunk.title,
+                batch=batch,
+            )
         return len(relations)
 
     def query_entity_relations(
