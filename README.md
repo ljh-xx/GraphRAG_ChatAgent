@@ -29,15 +29,23 @@
 
 复制 `.env.example` 为 `.env`，至少填写：
 
-- `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`
-- `OPENAI_CHAT_MODEL`
-- `EMBEDDING_PROVIDER`
-- `LOCAL_EMBED_MODEL`
-- `EMBEDDING_DEVICE`
-- `NEO4J_URI`
-- `NEO4J_USERNAME`
-- `NEO4J_PASSWORD`
+```env
+# 推荐：逗号分隔多个 Key，配额耗尽自动轮换（兼容旧写法 OPENAI_API_KEY）
+OPENAI_API_KEYS=sk-key1,sk-key2
+OPENAI_BASE_URL=https://api.openai.com/v1
+# 推荐：逗号分隔多个模型，当前模型不可用时自动降级（兼容旧写法 OPENAI_CHAT_MODEL）
+OPENAI_CHAT_MODELS=your-chat-model
+EMBEDDING_PROVIDER=local
+LOCAL_EMBED_MODEL=BAAI/bge-small-zh-v1.5
+EMBEDDING_DEVICE=cpu
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+# 向量库分批写入大小（控制内存峰值，默认 500）
+VECTOR_BATCH_SIZE=500
+```
+
+> **多 Key / 多模型说明**：`OPENAI_API_KEYS` 和 `OPENAI_CHAT_MODELS` 用英文逗号分隔。故障转移顺序为"同 Key 内先换模型，所有模型耗尽再换 Key"。旧写法 `OPENAI_API_KEY` 和 `OPENAI_CHAT_MODEL` 仍然兼容。
 
 ## 运行方式
 
@@ -60,24 +68,30 @@ neo4j.bat console
 ```
 
 
-构建索引：
+构建索引（向量库 + 知识图谱，自动跳过已处理的数据）：
 
 ```bash
 kg-rag ingest
 ```
 
-只重建向量库，不构建知识图谱：
+> **增量更新**：新增文件到 `data/` 后直接运行上述命令即可，已入库的 chunk 会自动跳过。中途崩溃后重跑也不会重复处理已完成的数据。
+
+只构建向量库（不构建知识图谱，自动去重）：
+
+```bash
+kg-rag ingest-vector
+```
+
+重建向量库（删除旧数据，全新构建）：
 
 ```bash
 kg-rag ingest-vector --reset
 ```
 
-这个命令会在写入完成后自动启动一个新的 Python 进程做自检：重新打开本地 Chroma 并执行一次检索，尽早发现 HNSW 索引损坏问题。
-
 如果数据不在默认 `data/` 目录，也可以指定：
 
 ```bash
-kg-rag ingest-vector --reset --data-dir add_data
+kg-rag ingest-vector --data-dir add_data
 ```
 
 命令行提问：

@@ -36,8 +36,8 @@ class BatchConfig:
     """批处理相关参数，可根据数据规模和机器配置调整。"""
 
     # ---------- Chunk 相关 ----------
-    chunk_size = 1200       # chunk 最大 token 数（tiktoken cl100k_base 计量）
-    chunk_overlap = 180     # chunk 间重叠 token 数（chunk_size 的 15%）
+    chunk_size = 600       # chunk 最大 token 数（tiktoken cl100k_base 计量）
+    chunk_overlap = 60     # chunk 间重叠 token 数（chunk_size 的 15%）
 
     # ---------- 图谱抽取并发 ----------
     graph_workers = 16       # 并发抽取关系的线程数
@@ -112,16 +112,27 @@ def step_parse_and_chunk(settings: Settings) -> tuple:
 # ============================================================================
 
 def step_build_vector_store(settings: Settings, llm: LLMClient, chunks: list) -> VectorStore:
-    """构建 Chroma 向量库，分批写入。"""
+    """构建 Chroma 向量库，分批写入，跳过已入库的 chunk。"""
     print_separator("步骤 2/4：构建向量库 (ChromaDB)")
 
     batch_size = BatchConfig.vector_batch_size
-    vs = VectorStore(settings, llm, reset=True)
-    total = len(chunks)
+    vs = VectorStore(settings, llm, reset=False)
+
+    # 跳过已入库的 chunk
+    existing_ids = vs.get_existing_ids()
+    new_chunks = [c for c in chunks if c.chunk_id not in existing_ids]
+    skipped = len(chunks) - len(new_chunks)
+    if skipped > 0:
+        print(f"  检测到 {skipped} 个已入库 chunk，跳过 embedding")
+    if not new_chunks:
+        print(f"  所有 chunk 均已入库，无需写入")
+        return vs
+
+    total = len(new_chunks)
     t0 = time.perf_counter()
 
     for i in range(0, total, batch_size):
-        batch = chunks[i : i + batch_size]
+        batch = new_chunks[i : i + batch_size]
         vs.upsert_chunks(batch)
         progress = min(i + batch_size, total)
         elapsed = time.perf_counter() - t0
@@ -134,7 +145,7 @@ def step_build_vector_store(settings: Settings, llm: LLMClient, chunks: list) ->
         )
 
     t1 = time.perf_counter()
-    print(f"\n  向量库构建完成 ({format_duration(t1 - t0)})")
+    print(f"\n  向量库构建完成，本次写入 {total} 个（跳过 {skipped} 个）({format_duration(t1 - t0)})")
 
     # 自检
     vs.close()
@@ -150,7 +161,7 @@ def step_build_vector_store(settings: Settings, llm: LLMClient, chunks: list) ->
 # ============================================================================
 
 def step_build_graph(settings: Settings, llm: LLMClient, chunks: list) -> GraphStore:
-    """构建 Neo4j 知识图谱（并发抽取关系）。"""
+    """构建 Neo4j 知识图谱（并发抽取关系，跳过已处理的 chunk）。"""
     print_separator("步骤 3/4：构建知识图谱 (Neo4j)")
 
     gs = GraphStore(
@@ -161,15 +172,20 @@ def step_build_graph(settings: Settings, llm: LLMClient, chunks: list) -> GraphS
     gs.ensure_constraints()
     print("  Neo4j 约束已就绪")
 
+    # 跳过已处理的 chunk
+    processed_ids = gs.get_processed_chunk_ids()
+    remaining = [c for c in chunks if c.chunk_id not in processed_ids]
+    skipped = len(chunks) - len(remaining)
+    if skipped > 0:
+        print(f"  检测到 {skipped} 个已处理 chunk，自动跳过")
+    if not remaining:
+        print(f"  所有 chunk 均已处理，无需构建图谱")
+        return gs
+
     workers = max(1, BatchConfig.graph_workers)
-    total = len(chunks)
-    print(f"  并发 worker 数: {workers}，共 {total} 个 chunk")
+    total = len(remaining)
+    print(f"  并发 worker 数: {workers}，处理 {total} 个新 chunk（跳过 {skipped} 个）")
 
-    # 先将所有 chunk 写入 Neo4j（串行，保证节点存在）
-    for idx, chunk in enumerate(chunks, start=1):
-        gs.upsert_chunk(chunk)
-
-    # 并发抽取关系
     relation_count = 0
     completed = 0
     t0 = time.perf_counter()
@@ -177,7 +193,7 @@ def step_build_graph(settings: Settings, llm: LLMClient, chunks: list) -> GraphS
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="graph") as executor:
         future_map = {
             executor.submit(llm.extract_graph, chunk.text): (idx, chunk)
-            for idx, chunk in enumerate(chunks, start=1)
+            for idx, chunk in enumerate(remaining, start=1)
         }
 
         for future in as_completed(future_map):
@@ -187,6 +203,8 @@ def step_build_graph(settings: Settings, llm: LLMClient, chunks: list) -> GraphS
             except Exception as exc:
                 print(f"  [graph] 抽取失败 {idx}/{total}: {chunk.chunk_id} | {exc}")
             else:
+                # 抽取成功后再写入 Neo4j，保证断点续传安全
+                gs.upsert_chunk(chunk)
                 if relations:
                     gs.upsert_relations(chunk, relations)
                     relation_count += len(relations)

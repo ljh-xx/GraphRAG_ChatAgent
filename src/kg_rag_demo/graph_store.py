@@ -25,8 +25,8 @@ class GraphStore:
                 session.run(query)
 
     def get_processed_chunk_ids(self) -> set[str]:
-        """返回 Neo4j 中已存在 Chunk 节点的 chunk_id 集合，用于断点续传."""
-        query = "MATCH (c:Chunk) RETURN c.chunk_id AS chunk_id"
+        """返回已完整处理的 chunk_id（有 Chunk 节点且有 MENTIONS 关系）。"""
+        query = "MATCH (c:Chunk)-[:MENTIONS]->(:Entity) RETURN DISTINCT c.chunk_id AS chunk_id"
         with self.driver.session() as session:
             result = session.run(query)
             return {record["chunk_id"] for record in result}
