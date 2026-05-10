@@ -303,7 +303,15 @@ with st.sidebar:
     if st.button("构建索引", use_container_width=True):
         with st.spinner("正在解析文档并写入索引..."):
             result = pipeline.ingest()
-        st.success(f"完成: 文档 {result['documents']}，切块 {result['chunks']}，关系 {result['relations']}")
+        skipped = result.get("skipped_chunks", 0)
+        skip_msg = f"，跳过 {skipped} 个已处理" if skipped > 0 else ""
+        st.success(
+            f"完成: 文档 {result['documents']}，"
+            f"向量写入 {result['vector_chunks']}，"
+            f"图谱处理 {result['new_graph_chunks']}/{result['graph_chunks']}"
+            f"{skip_msg}，"
+            f"关系 {result['relations']}"
+        )
 
     st.markdown(
         """
